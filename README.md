@@ -47,7 +47,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-IntelNicDriver
 | `-OnlyMatchingHardware` | Nur INFs installieren, deren Hardware-IDs im System vorhanden sind |
 | `-NoInstall` | Nur in den Treiberspeicher aufnehmen (`pnputil /add-driver` ohne `/install`) |
 | `-LogDir` | Ablage für Log, CSVs und Rollback-Script (Standard: `C:\Windows\Temp\IntelNicDriver`) |
-| `-WhatIf` / `-Confirm` | Testlauf bzw. Rückfrage vor jedem `pnputil`-Aufruf |
+| `-WhatIf` | Testlauf: zeigt die `pnputil`-Befehle nur an, installiert nichts |
+| `-Verbose` | Zusätzliche Details (z. B. welche INF wegen `InfExclude` oder fehlender Hardware entfällt) |
 
 ## Betriebssystem → INI-Abschnitt
 
@@ -78,6 +79,8 @@ Aus dem Abschnitt werden `InfDir` (Treiberordner), `InfExclude` (ausgelassene IN
 | 1 | Mindestens ein Fehler |
 
 ## Hinweise
+
+- Das Script verwendet bewusst kein `[CmdletBinding()]`; `-WhatIf` und `-Verbose` sind normale Schalter. Dadurch läuft es auch in der ISE (F8) oder in die Konsole eingefügt.
 
 - Beim Installieren oder Aktualisieren eines Netzwerktreibers ist die Verbindung über den Adapter kurz unterbrochen – bei RDP/PS-Remoting einplanen.
 - Die Intel-CD selbst ist **nicht** Teil dieses Repos; sie wird bei Intel heruntergeladen.

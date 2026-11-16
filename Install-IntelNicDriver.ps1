@@ -37,6 +37,12 @@
 .PARAMETER NoInstall
     Treiber nur in den Treiberspeicher aufnehmen (pnputil /add-driver ohne /install).
 
+.PARAMETER WhatIf
+    Testlauf: zeigt erkannten Abschnitt und die INF-Dateien, ruft pnputil aber nicht auf.
+
+.PARAMETER Verbose
+    Zusätzliche Detailausgaben (z. B. welche INF wegen InfExclude oder fehlender Hardware entfällt).
+
 .PARAMETER LogDir
     Ordner für Transcript, Ergebnis-CSV, Treiber-Sicherung und Rollback-Script.
 
@@ -56,10 +62,8 @@
     Bei Remote-Sitzungen (RDP/PS-Remoting) über den betroffenen Adapter einplanen!
 #>
 
-# CmdletBinding macht das Script zu einem "Advanced Script":
-#  - SupportsShouldProcess liefert automatisch die Parameter -WhatIf und -Confirm
-#  - außerdem stehen -Verbose, -Debug usw. zur Verfügung
-[CmdletBinding(SupportsShouldProcess = $true)]
+# Bewusst OHNE [CmdletBinding()]: -WhatIf und -Verbose sind unten als normale Schalter definiert.
+# So läuft das Script in jeder Umgebung (auch ISE/F8 oder in die Konsole eingefügt).
 param(
     # ==========================================================================
     #  NAME DES CD-ORDNERS  (liegt im selben Ordner wie dieses Script)
@@ -72,8 +76,13 @@ param(
     [string]$Section,                 # optional: INI-Abschnitt erzwingen (überschreibt OS-Erkennung)
     [switch]$OnlyMatchingHardware,    # nur Treiber für tatsächlich vorhandene Intel-Hardware
     [switch]$NoInstall,               # nur in den Treiberspeicher aufnehmen, nicht an Geräte binden
-    [string]$LogDir = (Join-Path $env:SystemRoot 'Temp\IntelNicDriver')   # Ablage für Logs/CSV/Rollback
+    [string]$LogDir = (Join-Path $env:SystemRoot 'Temp\IntelNicDriver'),  # Ablage für Logs/CSV/Rollback
+    [switch]$WhatIf,                  # Testlauf: nichts installieren, nur anzeigen
+    [switch]$Verbose                  # zusätzliche Detailausgaben
 )
+
+# -Verbose: Write-Verbose-Meldungen sichtbar machen
+if ($Verbose) { $VerbosePreference = 'Continue' }
 
 # Strenger Modus: Zugriff auf nicht gesetzte Variablen/Eigenschaften erzeugt einen Fehler
 Set-StrictMode -Version 2.0
@@ -84,8 +93,12 @@ $ErrorActionPreference = 'Stop'
 #  - $PSScriptRoot: Normalfall (Start als .ps1-Datei, auch mit -File)
 #  - $MyInvocation.MyCommand.Path: Fallback für ältere Hosts
 #  - aktueller Ordner: letzter Fallback (z. B. Code markiert und mit F8 in der ISE ausgeführt)
+# Pfad der Script-Datei; StrictMode-sicher gelesen (beim Einfügen in die Konsole gibt es keine Path-Eigenschaft)
+$cmdPathProp = $MyInvocation.MyCommand.PSObject.Properties['Path']
+$ScriptFile  = if ($cmdPathProp -and $cmdPathProp.Value) { [string]$cmdPathProp.Value } else { '' }
+$RunAsFile   = [bool]$ScriptFile                     # True = als .ps1-Datei gestartet
 $ScriptDir = $PSScriptRoot
-if (-not $ScriptDir -and $MyInvocation.MyCommand.Path) { $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $ScriptDir -and $ScriptFile) { $ScriptDir = Split-Path -Parent $ScriptFile }
 if (-not $ScriptDir) { $ScriptDir = (Get-Location).ProviderPath }
 
 #region Funktionen ---------------------------------------------------------------
@@ -354,13 +367,9 @@ $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 New-Item -ItemType Directory -Path $LogDir -Force -WhatIf:$false | Out-Null
 $transcript = Join-Path $LogDir "Install-IntelNicDriver_$timestamp.log"
 
-# Transcript (komplette Konsolenausgabe in Datei) starten.
-# WhatIf vorübergehend abschalten, sonst würde auch das Protokoll nur "simuliert".
-# (PS 5.1 kennt -WhatIf bei Stop-Transcript nicht, daher über die Preference-Variable)
-$script:savedWhatIf = $WhatIfPreference
-$WhatIfPreference = $false
+# Transcript (komplette Konsolenausgabe in Datei) starten - auch im Testlauf
 Start-Transcript -LiteralPath $transcript | Out-Null
-$WhatIfPreference = $script:savedWhatIf
+if ($WhatIf) { Write-Host '*** TESTLAUF (-WhatIf): es wird nichts installiert ***' -ForegroundColor Magenta }
 
 $exitCode = 0      # Rückgabewert des Scripts; wird bei Fehlern / Neustartbedarf angepasst
 
@@ -492,7 +501,7 @@ try {
 
     #region Sicherung vorher ------------------------------------------------------
 
-    $doChanges = -not $WhatIfPreference      # True = echter Lauf, False = Testlauf mit -WhatIf
+    $doChanges = -not $WhatIf                # True = echter Lauf, False = Testlauf mit -WhatIf
     $before = $null
     if ($doChanges) {
         # Aktuellen Stand des Treiberspeichers (nur Drittanbieter-Pakete oemXX.inf) sichern.
@@ -518,9 +527,9 @@ try {
         $pnpArgs = @('/add-driver', $inf.FullName)
         if (-not $NoInstall) { $pnpArgs += '/install' }                 # /install = sofort an passende Geräte binden
 
-        # ShouldProcess: bei -WhatIf nur anzeigen, bei -Confirm nachfragen
-        if (-not $PSCmdlet.ShouldProcess($inf.FullName, "pnputil $($pnpArgs[0]) $(if (-not $NoInstall) {'/install'})")) {
-            # Testlauf: nur als "WhatIf" in die Ergebnisliste aufnehmen
+        # Testlauf: Befehl nur anzeigen und als "WhatIf" in die Ergebnisliste aufnehmen
+        if ($WhatIf) {
+            Write-Host "WhatIf: pnputil $($pnpArgs -join ' ')" -ForegroundColor DarkCyan
             $results.Add([pscustomobject]@{ Inf = $inf.Name; Ordner = $inf.Directory.FullName.Substring($cdRoot.Length).TrimStart('\'); ExitCode = $null; Status = 'WhatIf' })
             continue
         }
@@ -617,14 +626,15 @@ catch {
     $exitCode = 1
 }
 finally {
-    # Wird IMMER ausgeführt (auch nach Fehler oder 'return'): Transcript sauber beenden.
-    # WhatIf dafür kurz abschalten, danach wiederherstellen.
-    $WhatIfPreference = $false
+    # Wird IMMER ausgeführt (auch nach Fehler oder 'return'): Transcript sauber beenden
     try { Stop-Transcript | Out-Null } catch { }
-    $WhatIfPreference = $script:savedWhatIf
 }
 
 # Exit-Code an den Aufrufer zurückgeben (z. B. für SCCM/MDT/Task-Sequenzen)
-exit $exitCode
+if ($RunAsFile) {
+    exit $exitCode                        # als Datei gestartet: Exit-Code zurückgeben
+} else {
+    $global:LASTEXITCODE = $exitCode      # eingefügt/F8: Konsole nicht schließen, Code nur setzen
+}
 
 #endregion
