@@ -67,7 +67,18 @@ Aus dem Abschnitt werden `InfDir` (Treiberordner), `InfExclude` (ausgelassene IN
 ## Sicherung und Rollback
 
 - Vor der Installation wird der Treiberspeicher als CSV gesichert (`DriverStore_vorher_<Zeit>.csv`).
-- Danach werden die neu hinzugekommenen `oemXX.inf`-Pakete ermittelt und ein Rollback-Script erzeugt (`Rollback-IntelNicDriver_<Zeit>.ps1`), das sie mit `pnputil /delete-driver ... /uninstall` wieder entfernt.
+- Nach der Installation wird ein Rollback-Script erzeugt (`Rollback-IntelNicDriver_<Zeit>.ps1`) – **auch wenn der Lauf mit einem Fehler abbricht** und auch auf Rechnern ohne vorherige Drittanbieter-Treiber.
+- Ins Rollback kommen nur Pakete, die **dieser Lauf** neu hinzugefügt hat (Abgleich über den Original-INF-Namen). Pakete, die zeitgleich z. B. durch Windows Update dazukommen, werden nur gemeldet und nicht entfernt.
+- Das Rollback-Script entfernt die Pakete mit `pnputil /delete-driver <oemXX.inf> /uninstall /force`, prüft jeden Exit-Code und lässt Windows anschließend die Geräte neu erkennen (`pnputil /scan-devices`, ab Build 18362). Windows bindet danach den nächstbesten vorhandenen Treiber.
+
+```powershell
+# Erst ansehen, dann ausführen
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Temp\IntelNicDriver\Rollback-IntelNicDriver_<Zeit>.ps1 -WhatIf
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Temp\IntelNicDriver\Rollback-IntelNicDriver_<Zeit>.ps1
+```
+
+Rollback-Exit-Codes: 0 = OK, 3010 = OK + Neustart, 1 = mindestens ein Paket nicht entfernt.
+
 - Ergebnis je INF steht in `Ergebnis_<Zeit>.csv`, die komplette Ausgabe im Transcript-Log.
 
 ## Exit-Codes

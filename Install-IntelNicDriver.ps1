@@ -351,6 +351,118 @@ function Get-InfHardwareIds {
     return ,$ids               # Komma: HashSet als Ganzes zurückgeben
 }
 
+function Write-RollbackScript {
+    <#
+      Ermittelt die durch diesen Lauf NEU in den Treiberspeicher gekommenen Pakete (oemXX.inf)
+      und schreibt ein Rollback-Script, das genau diese wieder entfernt.
+      - $Before         : Treiberspeicher vor der Installation (darf auch LEER sein)
+      - $InstalledInfs  : INF-Dateinamen, die dieser Lauf an pnputil übergeben hat
+      Nur Pakete, deren Original-INF-Name in $InstalledInfs steht, kommen ins Rollback.
+      So werden fremde Pakete (z. B. parallel durch Windows Update) nie mit gelöscht.
+    #>
+    param(
+        [object[]]$Before,
+        [System.Collections.Generic.HashSet[string]]$InstalledInfs,
+        [string]$Folder,
+        [string]$Stamp
+    )
+
+    # Treiberspeicher nach der Installation einlesen
+    $after = @(Get-WindowsDriver -Online | Select-Object Driver, OriginalFileName, ProviderName, ClassName, Version, Date)
+
+    # Alle vorher vorhandenen oemXX.inf-Namen in ein HashSet (schneller Vergleich, Groß/Klein egal)
+    $known = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($b in @($Before)) { if ($b) { [void]$known.Add([string]$b.Driver) } }
+
+    # Neu = jetzt vorhanden, vorher nicht
+    $allNew = @($after | Where-Object { -not $known.Contains([string]$_.Driver) })
+
+    # Aufteilen: Pakete aus diesem Lauf (Original-INF-Name passt zu einer installierten INF) und fremde Pakete
+    $newPkgs = @()
+    $foreign = @()
+    foreach ($pkg in $allNew) {
+        $leaf = Split-Path -Leaf ([string]$pkg.OriginalFileName)
+        if ($InstalledInfs.Contains($leaf)) { $newPkgs += $pkg } else { $foreign += $pkg }
+    }
+
+    # Fremde neue Pakete nur melden, nicht ins Rollback aufnehmen
+    foreach ($f in $foreign) {
+        Write-Warning "Neues Paket stammt nicht aus diesem Lauf, wird NICHT ins Rollback aufgenommen: $($f.Driver) ($(Split-Path -Leaf ([string]$f.OriginalFileName)))"
+    }
+
+    if ($newPkgs.Count -eq 0) {
+        Write-Host 'Keine neuen Treiberpakete aus diesem Lauf (alles bereits im Treiberspeicher vorhanden) - kein Rollback nötig.'
+        return
+    }
+
+    $rollback = Join-Path $Folder "Rollback-IntelNicDriver_$Stamp.ps1"
+
+    # --- Paketliste für das Rollback-Script (einfache Anführungszeichen werden verdoppelt) ---
+    $pkgLines = foreach ($p in $newPkgs) {
+        $inf = Split-Path -Leaf ([string]$p.OriginalFileName)
+        "    @{{ Driver = '{0}'; Inf = '{1}'; Version = '{2}' }}" -f `
+            ([string]$p.Driver -replace "'", "''"), ($inf -replace "'", "''"), ([string]$p.Version -replace "'", "''")
+    }
+
+    # --- Inhalt des Rollback-Scripts (Here-String: $ wird NICHT ersetzt, außer in den Platzhaltern) ---
+    $template = @'
+#Requires -RunAsAdministrator
+# Rollback für Install-IntelNicDriver vom __STAMP__
+# Entfernt die in diesem Lauf neu hinzugefügten Treiberpakete wieder.
+# Windows bindet danach den nächstbesten vorhandenen Treiber (älteres Paket oder Inbox-Treiber).
+# ACHTUNG: Die Netzwerkverbindung über betroffene Adapter wird kurz unterbrochen.
+#
+# Aufruf (als Administrator):
+#   powershell.exe -NoProfile -ExecutionPolicy Bypass -File "__PATH__"
+#   Mit -WhatIf wird nur angezeigt, was entfernt würde.
+
+param([switch]$WhatIf)
+
+# Zu entfernende Pakete (Driver = Name im Treiberspeicher, Inf = Original-INF, Version)
+$packages = @(
+__PACKAGES__
+)
+
+$pnputil = Join-Path $env:SystemRoot 'System32\pnputil.exe'
+$errors  = 0
+$reboot  = $false
+
+# Jedes Paket einzeln entfernen und Exit-Code prüfen
+foreach ($p in $packages) {
+    $text = "pnputil /delete-driver $($p.Driver) /uninstall /force   ($($p.Inf) $($p.Version))"
+    if ($WhatIf) { Write-Host "WhatIf: $text"; continue }
+    Write-Host $text -ForegroundColor Yellow
+    & $pnputil /delete-driver $p.Driver /uninstall /force
+    switch ($LASTEXITCODE) {
+        0       { }                                   # OK
+        3010    { $reboot = $true }                   # OK, Neustart nötig
+        default { Write-Warning "Fehler $LASTEXITCODE bei $($p.Driver)"; $errors++ }
+    }
+}
+
+# Geräte neu erkennen, damit Windows sofort den nächstbesten Treiber bindet
+# (pnputil /scan-devices gibt es erst ab Windows 10 1903 / Build 18362)
+if (-not $WhatIf -and [Environment]::OSVersion.Version.Build -ge 18362) { & $pnputil /scan-devices | Out-Null }
+
+if ($errors -gt 0) { Write-Warning "$errors Paket(e) konnten nicht entfernt werden."; exit 1 }
+if ($WhatIf)       { Write-Host 'Testlauf beendet - nichts entfernt.'; exit 0 }
+if ($reboot)       { Write-Warning 'Neustart erforderlich.'; exit 3010 }
+Write-Host 'Rollback abgeschlossen.' -ForegroundColor Green
+exit 0
+'@
+
+    # Platzhalter füllen
+    $content = $template.Replace('__STAMP__', $Stamp).Replace('__PATH__', $rollback).Replace('__PACKAGES__', ($pkgLines -join "`r`n"))
+
+    # UTF8 schreibt in PS 5.1 mit BOM -> Umlaute in den Kommentaren bleiben lesbar
+    Set-Content -LiteralPath $rollback -Value $content -Encoding UTF8 -WhatIf:$false
+
+    Write-Host ''
+    Write-Host "Neue Treiberpakete: $($newPkgs.Count)  -> Rollback-Script: $rollback" -ForegroundColor Green
+    # Tabelle der neuen Pakete (Format-Table -> Text -> Write-Host, damit sie sicher im Transcript landet)
+    $newPkgs | Format-Table Driver, @{n='INF';e={Split-Path -Leaf ([string]$_.OriginalFileName)}}, Version -AutoSize | Out-String -Width 250 | Write-Host
+}
+
 #endregion
 
 #region Vorbereitung -------------------------------------------------------------
@@ -372,6 +484,13 @@ Start-Transcript -LiteralPath $transcript | Out-Null
 if ($WhatIf) { Write-Host '*** TESTLAUF (-WhatIf): es wird nichts installiert ***' -ForegroundColor Magenta }
 
 $exitCode = 0      # Rückgabewert des Scripts; wird bei Fehlern / Neustartbedarf angepasst
+
+# Für das Rollback im finally-Block schon hier anlegen (StrictMode: Variablen müssen existieren)
+$doChanges      = $false     # True = echter Lauf (kein -WhatIf)
+$before         = $null      # Treiberspeicher vor der Installation; $null = noch nicht gesichert
+$pnputilStarted = $false     # True, sobald mindestens ein pnputil-Aufruf erfolgt ist
+# INF-Dateinamen, die an pnputil übergeben wurden (Groß/Klein egal)
+$installedInfs  = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 
 try {
     # --- SetupBD.ini finden ---------------------------------------------------------
@@ -502,7 +621,6 @@ try {
     #region Sicherung vorher ------------------------------------------------------
 
     $doChanges = -not $WhatIf                # True = echter Lauf, False = Testlauf mit -WhatIf
-    $before = $null
     if ($doChanges) {
         # Aktuellen Stand des Treiberspeichers (nur Drittanbieter-Pakete oemXX.inf) sichern.
         # Daraus wird nach der Installation ermittelt, welche Pakete neu sind -> Rollback.
@@ -535,6 +653,8 @@ try {
         }
 
         Write-Host "pnputil -> $($inf.Name)" -ForegroundColor Yellow
+        [void]$installedInfs.Add($inf.Name)      # für das Rollback merken
+        $pnputilStarted = $true
 
         # In PS 5.1 wird stderr eines externen Programms bei ErrorActionPreference=Stop zum Abbruch
         # -> für den pnputil-Aufruf vorübergehend auf 'Continue' setzen
@@ -566,42 +686,7 @@ try {
 
     #region Rollback-Script & Zusammenfassung ------------------------------------
 
-    if ($doChanges -and $before) {
-        # Treiberspeicher nach der Installation erneut einlesen
-        $after = @(Get-WindowsDriver -Online | Select-Object Driver, OriginalFileName, ProviderName, ClassName, Version, Date)
-
-        # Alle vorher vorhandenen oemXX.inf-Namen in ein HashSet
-        $known = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-        $before | ForEach-Object { [void]$known.Add($_.Driver) }
-
-        # Neu = jetzt vorhanden, vorher nicht
-        $newPkgs = @($after | Where-Object { -not $known.Contains($_.Driver) })
-
-        if ($newPkgs.Count -gt 0) {
-            # Rollback-Script mit pnputil /delete-driver für jedes neue Paket schreiben
-            $rollback = Join-Path $LogDir "Rollback-IntelNicDriver_$timestamp.ps1"
-            $lines = @(
-                '#Requires -RunAsAdministrator'
-                "# Rollback für Install-IntelNicDriver vom $timestamp"
-                '# Entfernt die neu hinzugefügten Treiberpakete; Windows wählt danach den nächstbesten vorhandenen Treiber.'
-                '# ACHTUNG: Netzwerkverbindung über betroffene Adapter wird kurz unterbrochen.'
-                ''
-            )
-            foreach ($p in $newPkgs) {
-                # Kommentarzeile mit Original-INF-Name und Version, dann der Löschbefehl
-                $lines += "# $($p.OriginalFileName | Split-Path -Leaf)  Version $($p.Version)"
-                $lines += "pnputil.exe /delete-driver $($p.Driver) /uninstall /force"
-            }
-            Set-Content -LiteralPath $rollback -Value $lines -Encoding UTF8 -WhatIf:$false
-
-            Write-Host ''
-            Write-Host "Neue Treiberpakete: $($newPkgs.Count)  -> Rollback-Script: $rollback" -ForegroundColor Green
-            # Tabelle der neuen Pakete (Format-Table -> Text -> Write-Host, damit sie sicher im Transcript landet)
-            $newPkgs | Format-Table Driver, @{n='INF';e={Split-Path $_.OriginalFileName -Leaf}}, Version -AutoSize | Out-String -Width 250 | Write-Host
-        } else {
-            Write-Host 'Keine neuen Treiberpakete (alles bereits im Treiberspeicher vorhanden).'
-        }
-    }
+    # Das Rollback-Script wird im finally-Block erzeugt -> auch nach einem Abbruch
 
     # Ergebnisliste als CSV speichern
     $resultCsv = Join-Path $LogDir "Ergebnis_$timestamp.csv"
@@ -626,6 +711,19 @@ catch {
     $exitCode = 1
 }
 finally {
+    # Rollback-Script schreiben - auch wenn der Lauf mit Fehler abgebrochen ist.
+    # Bedingung: echter Lauf, Sicherung vorher vorhanden ($null-Prüfung: eine LEERE Liste ist gültig!)
+    # und mindestens ein pnputil-Aufruf erfolgt.
+    if ($doChanges -and $null -ne $before -and $pnputilStarted) {
+        try {
+            Write-RollbackScript -Before $before -InstalledInfs $installedInfs -Folder $LogDir -Stamp $timestamp
+        } catch {
+            Write-Host "FEHLER beim Erzeugen des Rollback-Scripts: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "Sicherung des Treiberspeichers vor der Installation: DriverStore_vorher_$timestamp.csv" -ForegroundColor Red
+            $exitCode = 1
+        }
+    }
+
     # Wird IMMER ausgeführt (auch nach Fehler oder 'return'): Transcript sauber beenden
     try { Stop-Transcript | Out-Null } catch { }
 }
